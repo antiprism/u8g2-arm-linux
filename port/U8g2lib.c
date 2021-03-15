@@ -1,10 +1,38 @@
 #include "U8g2lib.h"
 
-static int i2c_device;
-static const char i2c_bus[] = "/dev/i2c-1";
+#define DEV_NAME_LEN 32 // maximum length of I2C/SPI device name
+static char dev_name[DEV_NAME_LEN];
 
-static int spi_device;
-static const char spi_bus[] = "/dev/spidev0.0";
+// Hold details about an I2C or SPI device
+//   SPI device name: /dev/spidevN.M with N=bus_number, M=CS_number
+//   I2C device name: /dev/i2c-N with N=bus_number
+typedef struct u8g2arm_setup_t {
+  int dev_fd;           // SPI/I2C  - file descriptor (set when opened)
+  uint8_t bus_number;   // SPI/I2C  - bus number
+  uint8_t cs_number;    // SPI only - chip select number
+} u8g2arm_setup_t;
+
+static u8g2arm_setup_t *get_setup_ptr(u8x8_t *u8x8)
+{
+   return u8x8_GetUserPtr(u8x8);
+}
+
+int u8g2arm_arm_init_hw_spi(u8x8_t *u8x8, int bus_number, int cs_number)
+{
+  u8g2arm_setup_t *p_setup = (u8g2arm_setup_t *)malloc(sizeof(u8g2arm_setup_t));
+  u8x8_SetUserPtr(u8x8, p_setup);
+  if(p_setup) {
+    p_setup->bus_number = bus_number;
+    p_setup->cs_number = cs_number;
+    p_setup->dev_fd = -1;  // invalid file descriptor
+  }
+  return p_setup != NULL;
+}
+
+int u8g2arm_arm_init_hw_i2c(u8x8_t *u8x8, int bus_number)
+{
+  return u8g2arm_arm_init_hw_spi(u8x8, bus_number, -1);
+}
 
 uint8_t u8x8_arm_linux_gpio_and_delay(u8x8_t *u8x8, uint8_t msg, uint8_t arg_int, void *arg_ptr)
 {
@@ -237,6 +265,7 @@ uint8_t u8x8_byte_arm_linux_hw_i2c(u8x8_t *u8x8, uint8_t msg, uint8_t arg_int, v
     static uint8_t buffer[32];        
     static uint8_t buf_idx;
     uint8_t *data;
+    u8g2arm_setup_t *p_setup;
 
     switch(msg)
     {
@@ -251,18 +280,22 @@ uint8_t u8x8_byte_arm_linux_hw_i2c(u8x8_t *u8x8, uint8_t msg, uint8_t arg_int, v
             break;
 
         case U8X8_MSG_BYTE_INIT:
-            i2c_device = openI2CDevice(i2c_bus);
-            // printf("I2C File Descriptor: %d\n", fd);
+            p_setup = get_setup_ptr(u8x8);
+            snprintf(dev_name, DEV_NAME_LEN, "/dev/i2c-%d",
+                p_setup->bus_number);
+            p_setup->dev_fd = openI2CDevice(dev_name);
+            // printf("I2C File Descriptor: %d\n", p_setup->dev_fd);
             break;
 
         case U8X8_MSG_BYTE_START_TRANSFER:
-            setI2CSlave(i2c_device, u8x8_GetI2CAddress(u8x8)>>1);
+            setI2CSlave(get_setup_ptr(u8x8)->dev_fd,
+                u8x8_GetI2CAddress(u8x8)>>1);
             buf_idx = 0;
             // printf("I2C Address: %02x\n", u8x8_GetI2CAddress(u8x8)>>1);
             break;
 
         case U8X8_MSG_BYTE_END_TRANSFER:
-            I2CWriteBytes(i2c_device, buffer, buf_idx);
+            I2CWriteBytes(get_setup_ptr(u8x8)->dev_fd, buffer, buf_idx);
             break;
 
         default:
@@ -276,11 +309,13 @@ uint8_t u8x8_byte_arm_linux_hw_spi(u8x8_t *u8x8, uint8_t msg, uint8_t arg_int, v
     uint8_t *data;
     uint8_t tx[2], rx[2];
     uint8_t internal_spi_mode;
+    u8g2arm_setup_t *p_setup;
 
     switch(msg) 
     {
         case U8X8_MSG_BYTE_SEND:
             data = (uint8_t *)arg_ptr;
+            p_setup = get_setup_ptr(u8x8);
             // printf("Buffering Data %d \n", arg_int);
 
             while( arg_int > 0) 
@@ -296,7 +331,7 @@ uint8_t u8x8_byte_arm_linux_hw_spi(u8x8_t *u8x8, uint8_t msg, uint8_t arg_int, v
                     .bits_per_word = 8,
                 };
 
-                SPITransfer(spi_device, &tr);
+                SPITransfer(p_setup->dev_fd, &tr);
                 data++;
                 arg_int--;
             }  
@@ -304,6 +339,10 @@ uint8_t u8x8_byte_arm_linux_hw_spi(u8x8_t *u8x8, uint8_t msg, uint8_t arg_int, v
             break;
 
         case U8X8_MSG_BYTE_INIT:
+            p_setup = get_setup_ptr(u8x8);
+            snprintf(dev_name, DEV_NAME_LEN, "/dev/spidev%d.%d",
+                p_setup->bus_number, p_setup->cs_number);
+
             //u8x8_gpio_SetCS(u8x8, u8x8->display_info->chip_disable_level);
             /* SPI mode has to be mapped to the mode of the current controller, at least Uno, Due, 101 have different SPI_MODEx values */
             /*   0: clock active high, data out on falling edge, clock default value is zero, takover on rising edge */
@@ -320,10 +359,11 @@ uint8_t u8x8_byte_arm_linux_hw_spi(u8x8_t *u8x8, uint8_t msg, uint8_t arg_int, v
             }
             // printf("SPI Device Mode Set\n");
 
-            spi_device = openSPIDevice(spi_bus, internal_spi_mode, 8, 500000);
-            if (spi_device  < 0 )
+            p_setup->dev_fd =
+                openSPIDevice(dev_name, internal_spi_mode, 8, 500000);
+            if (p_setup->dev_fd  < 0 )
             {
-                printf("Failed to open SPI Device %s\n", spi_bus);
+                printf("Failed to open SPI Device %s\n", dev_name);
             }
             else 
             {
